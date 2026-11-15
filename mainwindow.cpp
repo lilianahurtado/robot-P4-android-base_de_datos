@@ -14,26 +14,70 @@
 #include <QPlainTextEdit>
 #include <QStyle>
 #include <QJsonDocument>
+#include <QJsonObject>
 #include <QJsonValue>
 #include <QDateTime>
 #include <QChart>
 #include <QChartView>
 #include <QLineSeries>
 #include <QValueAxis>
+#include <QTableWidget>
+#include <QTableWidgetItem>
 
+#include <QDir>
+#include <QFile>
+#include <QSqlDatabase>
+#include <QSqlError>
+#include <QSqlQuery>
+#include <QStandardPaths>
 
-static const int MS_MOVIMIENTO = 400;   // duración de cada orden "mover"
-static const int MS_REPETIR = 200;      // cada cuánto se reenvía mientras se presiona
-static const int VENTANA_MUESTRAS = 40; // puntos visibles en la gráfica
-
-
-static const char *ALUMNO = "NOMBRE · CODIGO";
+static const int MS_MOVIMIENTO = 400;
+static const int MS_REPETIR = 200;
+static const int VENTANA_MUESTRAS = 40;
+static const char *ALUMNO = "ALUMNO · CODIGO · temperatura_XXXX.db";
+static const char *FUENTE = "dht22";
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
 {
     construirInterfaz();
 
+    // PASO 2: Creación/Apertura de la base de datos SQLite en AppDataLocation
+    const QString carpeta = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QDir().mkpath(carpeta);
+
+    const QString ruta = carpeta + "/temperatura_XXXX.db";
+    const bool yaExistia = QFile::exists(ruta);
+
+    QSqlDatabase db = QSqlDatabase::addDatabase("QSQLITE");
+    db.setDatabaseName(ruta);
+    if (!db.open()) {
+        registrar("No se abrió la base: " + db.lastError().text());
+    } else {
+        QSqlQuery consulta;
+        if (!consulta.exec("CREATE TABLE IF NOT EXISTS mediciones ("
+                           "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                           "fecha_hora TEXT NOT NULL, "
+                           "temperatura REAL NOT NULL, "
+                           "fuente TEXT NOT NULL, "
+                           "nota TEXT)")) {
+            registrar("No se creó la tabla: " + consulta.lastError().text());
+        } else {
+            registrar((yaExistia ? "Base encontrada: " : "Base nueva creada: ") + ruta);
+
+            QSqlQuery pragma("PRAGMA table_info(mediciones)");
+            int filasEsquema = 0;
+            while (pragma.next()) {
+                QString campo = pragma.value(1).toString();
+                QString tipo = pragma.value(2).toString();
+                registrar(QString("  [Col %1] %2 (%3)").arg(filasEsquema + 1).arg(campo).arg(tipo));
+                filasEsquema++;
+            }
+            registrar(QString("Esquema verificado: %1 campos en la tabla mediciones.").arg(filasEsquema));
+        }
+    }
+
+    // CONEXIONES Y TIMERS
     connect(&m_socket, &QWebSocket::connected, this, &MainWindow::alConectar);
     connect(&m_socket, &QWebSocket::disconnected, this, &MainWindow::alDesconectar);
     connect(&m_socket, &QWebSocket::textMessageReceived, this, &MainWindow::alRecibirMensaje);
@@ -52,8 +96,15 @@ MainWindow::MainWindow(QWidget *parent)
     m_medirAuto.setInterval(500);
     connect(&m_medirAuto, &QTimer::timeout, this, &MainWindow::alPresionarMedir);
 
-    m_barrido.setInterval(700);   // el firmware espera 500 ms antes de medir en cada "scan"
+    m_barrido.setInterval(700);
     connect(&m_barrido, &QTimer::timeout, this, &MainWindow::siguientePasoBarrido);
+
+    // Temporizador preciso de 10 segundos exactos
+    m_dhtAuto.setTimerType(Qt::PreciseTimer);
+    m_dhtAuto.setInterval(10000);
+    connect(&m_dhtAuto, &QTimer::timeout, this, [this]() {
+        enviar({{"tipo", "leer_dht"}});
+    });
 }
 
 // ---------------------------------------------------------------- interfaz
@@ -73,7 +124,7 @@ void MainWindow::construirInterfaz()
     auto *filaConexion = new QHBoxLayout(cajaConexion);
     m_ip = new QLineEdit(QStringLiteral("192.168.1.101"));
     m_ip->setPlaceholderText(tr("IP de la ESP32-S3"));
-    m_ip->setInputMethodHints(Qt::ImhPreferNumbers);   // teclado numérico en Android
+    m_ip->setInputMethodHints(Qt::ImhPreferNumbers);
     m_puerto = new QSpinBox;
     m_puerto->setRange(1, 65535);
     m_puerto->setValue(81);
@@ -87,10 +138,9 @@ void MainWindow::construirInterfaz()
     raiz->addWidget(cajaConexion);
     raiz->addWidget(m_estado);
 
-    // 2) Cruceta de movimiento: botones grandes para el dedo
+    // 2) Cruceta de movimiento
     auto *cajaMover = new QGroupBox(tr("Movimiento"));
     auto *cruceta = new QGridLayout(cajaMover);
-    // Íconos estándar de Qt: se ven iguales en Windows, Linux y Android
     cruceta->addWidget(botonMovimiento(QStyle::SP_ArrowUp, "avanzar"), 0, 1);
     cruceta->addWidget(botonMovimiento(QStyle::SP_ArrowLeft, "izquierda"), 1, 0);
     cruceta->addWidget(botonMovimiento(QStyle::SP_MediaStop, "parar"), 1, 1);
@@ -134,6 +184,13 @@ void MainWindow::construirInterfaz()
     connect(m_auto, &QCheckBox::toggled, this, [this](bool activo) {
         activo ? m_medirAuto.start() : m_medirAuto.stop();
     });
+
+    auto *chkAlarma = new QCheckBox(tr("Alarma Sonora"));
+    chkAlarma->setChecked(true);
+    connect(chkAlarma, &QCheckBox::toggled, this, [this](bool activo) {
+        enviar({{"tipo", "alarma"}, {"estado", activo}});
+    });
+    filaDist->addWidget(chkAlarma);
     colDist->addLayout(filaDist);
 
     m_serie = new QLineSeries;
@@ -164,23 +221,121 @@ void MainWindow::construirInterfaz()
     m_registro->setMaximumHeight(110);
     raiz->addWidget(m_registro);
 
-    setCentralWidget(central);
-    setWindowTitle(tr("Robot P3 · Android"));
+    // --- Configuración del QTabWidget (Pestañas) ---
+    auto *pestanas = new QTabWidget(this);
+    pestanas->addTab(central, "Robot");
 
-    //Extra Alarma Sonora (buzzer)
-        //switch para la alarma de sonido
-        auto *chkAlarma = new QCheckBox(tr("Alarma Sonora"));
-    chkAlarma->setChecked(true); // Activa por defecto
+    auto *pagTemp = new QWidget;
+    m_capaTemp = new QVBoxLayout(pagTemp);
+    m_capaTemp->setSpacing(12);
+    m_capaTemp->setContentsMargins(15, 15, 15, 15);
 
-    //conectar el evento para enviar el estado por WebSocket
-    connect(chkAlarma, &QCheckBox::toggled, this, [this](bool activo) {
-        enviar({{"tipo", "alarma"}, {"estado", activo}});
+    auto *alumnoTemp = new QLabel(QString::fromUtf8(ALUMNO));
+    alumnoTemp->setAlignment(Qt::AlignCenter);
+    alumnoTemp->setStyleSheet("font-weight: bold; color: #ffffff;");
+    m_capaTemp->addWidget(alumnoTemp);
+
+    auto *cajaTemp = new QGroupBox(tr("Sensor de Temperatura DHT22"));
+    auto *colTemp = new QVBoxLayout(cajaTemp);
+
+    m_temperatura = new QLabel(tr("-- °C"));
+    m_temperatura->setAlignment(Qt::AlignCenter);
+    QFont fuenteTemp = m_temperatura->font();
+    fuenteTemp.setPointSize(28);
+    fuenteTemp.setBold(true);
+    m_temperatura->setFont(fuenteTemp);
+    m_temperatura->setStyleSheet("color: #bd93f9;");
+
+    auto *botonLeerTemp = new QPushButton(tr("Leer temperatura"));
+    botonLeerTemp->setMinimumHeight(45);
+    botonLeerTemp->setStyleSheet(
+        "QPushButton { background-color: #6272a4; color: white; font-weight: bold; border-radius: 8px; font-size: 14px; }"
+        "QPushButton:hover { background-color: #7082b6; }"
+        "QPushButton:pressed { background-color: #44475a; }"
+        );
+
+    m_chkDhtAuto = new QCheckBox(tr("Guardar cada 10 s"));
+
+    colTemp->addWidget(m_temperatura);
+    colTemp->addWidget(botonLeerTemp);
+    colTemp->addWidget(m_chkDhtAuto);
+
+    // --- PASO 4: Tabla e Historial ---
+    auto *botonCargarHistorial = new QPushButton(tr("Cargar historial"));
+    botonCargarHistorial->setStyleSheet(
+        "QPushButton { background-color: #bd93f9; color: #1e1e2e; font-weight: bold; border-radius: 6px; padding: 6px; }"
+        "QPushButton:hover { background-color: #ff79c6; }"
+        );
+
+    m_tabla = new QTableWidget(0, 4);
+    m_tabla->setHorizontalHeaderLabels({"id", "fecha y hora", "°C", "nota"});
+    m_tabla->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+
+    m_total = new QLabel(tr("Mediciones guardadas: 0"));
+    m_total->setStyleSheet("font-weight: bold; color: #50fa7b;");
+
+    colTemp->addWidget(botonCargarHistorial);
+    colTemp->addWidget(m_tabla, 1);
+    colTemp->addWidget(m_total);
+
+    // --- PASO 5: Editar Nota (UPDATE) ---
+    auto *cajaNota = new QGroupBox(tr("Editar nota de medición"));
+    auto *colNota = new QVBoxLayout(cajaNota);
+
+    auto *filaCamposNota = new QHBoxLayout;
+    m_id = new QSpinBox;
+    m_id->setRange(0, 99999);
+    m_id->setSpecialValueText("-");
+
+    m_nota = new QLineEdit;
+    m_nota->setPlaceholderText(tr("Escribe una nota..."));
+
+    auto *botonGuardarNota = new QPushButton(tr("Guardar nota"));
+    botonGuardarNota->setStyleSheet(
+        "QPushButton { background-color: #50fa7b; color: #1e1e2e; font-weight: bold; border-radius: 6px; padding: 6px; }"
+        "QPushButton:hover { background-color: #69ff94; }"
+        );
+
+    filaCamposNota->addWidget(new QLabel(tr("ID:")));
+    filaCamposNota->addWidget(m_id, 1);
+    filaCamposNota->addWidget(m_nota, 3);
+    filaCamposNota->addWidget(botonGuardarNota, 2);
+
+    colNota->addLayout(filaCamposNota);
+    colTemp->addWidget(cajaNota);
+
+    m_capaTemp->addWidget(cajaTemp, 1);
+
+    // Eventos
+    connect(botonLeerTemp, &QPushButton::clicked, this, [this]() {
+        enviar({{"tipo", "leer_dht"}});
     });
 
-    filaDist->addWidget(chkAlarma);
+    connect(m_chkDhtAuto, &QCheckBox::toggled, this, [this](bool activo) {
+        if (activo) {
+            m_dhtAuto.start();
+        } else {
+            m_dhtAuto.stop();
+        }
+    });
+
+    connect(botonCargarHistorial, &QPushButton::clicked, this, &MainWindow::cargarHistorial);
+
+    connect(m_tabla, &QTableWidget::cellClicked, this, [this](int fila, int) {
+        if (m_tabla->item(fila, 0)) {
+            int idTocada = m_tabla->item(fila, 0)->text().toInt();
+            m_id->setValue(idTocada);
+        }
+    });
+
+    connect(botonGuardarNota, &QPushButton::clicked, this, &MainWindow::guardarNota);
+
+    pestanas->addTab(pagTemp, "Temperatura");
+    setCentralWidget(pestanas);
+
+    setWindowTitle(tr("Robot P4 · Android"));
 
     aplicarEstilosUI();
-
 }
 
 QPushButton *MainWindow::botonMovimiento(QStyle::StandardPixmap icono, const QString &accion)
@@ -191,7 +346,6 @@ QPushButton *MainWindow::botonMovimiento(QStyle::StandardPixmap icono, const QSt
     b->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     b->setAccessibleName(accion);
 
-    // Estilo CSS con cambio de color al presionar (pressed)
     b->setStyleSheet(
         "QPushButton { background-color: #34495e; color: #ecf0f1; border-radius: 12px; border: 2px solid #2c3e50; }"
         "QPushButton:hover { background-color: #415b76; }"
@@ -218,25 +372,21 @@ QPushButton *MainWindow::botonMovimiento(QStyle::StandardPixmap icono, const QSt
     return b;
 }
 
-//UI
 void MainWindow::aplicarEstilosUI() {
-    // 1) Fondo de la ventana principal y color de texto general blanco
-    // Estilo para los QCheckBox (Automático y Alarma Sonora)
     this->setStyleSheet(
-        "QMainWindow { background-color: #1e1e2e; }"
-        "QGroupBox { color: #ffffff; font-weight: bold; border: 1px solid #44475a; border-radius: 8px; margin-top: 10px; padding-top: 10px; }"
+        "QMainWindow, QTabWidget::pane { background-color: #1e1e2e; border: none; }"
+        "QTabBar::tab { background-color: #2b2b3b; color: #a6adc8; padding: 8px 16px; font-weight: bold; border-top-left-radius: 6px; border-top-right-radius: 6px; margin-right: 2px; }"
+        "QTabBar::tab:selected { background-color: #44475a; color: #ffffff; border-bottom: 2px solid #bd93f9; }"
+        "QTabBar::tab:hover { background-color: #36364a; color: #ffffff; }"
+        "QGroupBox { background-color: #1e1e2e; color: #ffffff; font-weight: bold; border: 1px solid #44475a; border-radius: 8px; margin-top: 10px; padding-top: 10px; }"
         "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #ffffff; }"
         "QLabel { color: #ffffff; font-size: 13px; }"
-
-        // Configuración completa del CheckBox
         "QCheckBox { color: #ffffff; font-size: 13px; spacing: 6px; }"
         "QCheckBox::indicator { width: 18px; height: 18px; border-radius: 4px; border: 2px solid #6272a4; background-color: #2b2b3b; }"
         "QCheckBox::indicator:hover { border-color: #bd93f9; }"
-        // Cuadro al estar marcado: fondo blanco/claro con la palomita en negro intenso
         "QCheckBox::indicator:checked { background-color: #ffffff; border: 2px solid #ffffff; image: url(:/qt-project.org/styles/commonstyle/images/check-16.png); }"
         );
 
-    // 2) Campo de texto de IP
     if (m_ip) {
         m_ip->setStyleSheet(
             "QLineEdit { background-color: #2b2b3b; color: #ffffff; border: 2px solid #44475a; "
@@ -245,7 +395,6 @@ void MainWindow::aplicarEstilosUI() {
             );
     }
 
-    // 3) Botón de conexión en estado desconectado (Rojo)
     if (m_conectar) {
         m_conectar->setStyleSheet(
             "QPushButton { background-color: #c0392b; color: white; border-radius: 8px; font-weight: bold; padding: 6px; font-size: 13px; }"
@@ -253,19 +402,16 @@ void MainWindow::aplicarEstilosUI() {
             );
     }
 
-    // 4) Estado inicial de la etiqueta de estado
     if (m_estado) {
         m_estado->setStyleSheet("QLabel { color: #a6adc8; font-weight: bold; }");
     }
 
-    // 5) Registro de texto inferior
     if (m_registro) {
         m_registro->setStyleSheet(
             "QPlainTextEdit { background-color: #181825; color: #a6adc8; border: 1px solid #44475a; border-radius: 6px; font-family: monospace; }"
             );
     }
 
-    // 6) Estilo oscuro de la Gráfica
     if (m_serie && m_serie->chart()) {
         QChart *chart = m_serie->chart();
         chart->setBackgroundBrush(QBrush(QColor("#2b2b3b")));
@@ -280,7 +426,6 @@ void MainWindow::aplicarEstilosUI() {
         }
     }
 }
-
 
 // ---------------------------------------------------------------- conexión
 void MainWindow::alPresionarConectar()
@@ -314,7 +459,15 @@ void MainWindow::alDesconectar()
     m_repetir.stop();
     m_medirAuto.stop();
     m_barrido.stop();
-    m_auto->setChecked(false);
+    m_dhtAuto.stop();
+
+    if (m_chkDhtAuto) {
+        m_chkDhtAuto->setChecked(false);
+    }
+    if (m_auto) {
+        m_auto->setChecked(false);
+    }
+
     m_estado->setText(tr("Estado: Desconectado"));
     m_conectar->setText(tr("Conectar"));
     m_conectar->setStyleSheet(
@@ -358,12 +511,22 @@ void MainWindow::alRecibirMensaje(const QString &texto)
         agregarDistancia(obj.value("d").toDouble());
         registrar(tr("scan %1° → %2 cm").arg(obj.value("angulo").toInt())
                       .arg(obj.value("d").toDouble(), 0, 'f', 1));
+    } else if (tipo == "dht_lectura") {
+        registrar("RX " + texto);
+        const QJsonValue t = obj.value("temperatura");
+        if (!obj.value("dht_ok").toBool() || !t.isDouble()) {
+            registrar("Lectura inválida: no se guarda");
+            return;
+        }
+        if (m_temperatura) {
+            m_temperatura->setText(QString::number(t.toDouble(), 'f', 1) + " °C");
+        }
+        guardarTemperatura(t.toDouble());
     } else if (tipo == "saludo") {
         registrar(tr("saludo de %1").arg(obj.value("nombre_host").toString()));
     } else if (tipo == "mover_err") {
         registrar(tr("el robot rechazó la orden %1").arg(obj.value("accion").toString()));
     } else if (tipo == "latido_ok" || tipo == "telemetria" || tipo.startsWith("mover_")) {
-        // frecuentes: no se registran para no llenar la pantalla
     } else {
         registrar(texto);
     }
@@ -375,7 +538,7 @@ void MainWindow::alMoverServo(int angulo)
     m_angulo->setText(QStringLiteral("%1°").arg(angulo));
     m_anguloPendiente = angulo;
     if (!m_servo.isActive())
-        m_servo.start();   // como máximo un mensaje cada 60 ms aunque el dedo se deslice rápido
+        m_servo.start();
 }
 
 void MainWindow::enviarServoPendiente()
@@ -404,7 +567,7 @@ void MainWindow::siguientePasoBarrido()
         return;
     }
     enviar({{"tipo", "scan"}, {"angulo", m_anguloBarrido}});
-    m_slider->blockSignals(true);   // mueve el deslizador sin mandar otra orden "servo"
+    m_slider->blockSignals(true);
     m_slider->setValue(m_anguloBarrido);
     m_slider->blockSignals(false);
     m_angulo->setText(QStringLiteral("%1°").arg(m_anguloBarrido));
@@ -415,11 +578,10 @@ void MainWindow::agregarDistancia(double cm)
 {
     m_distancia->setText(QStringLiteral("%1 cm").arg(cm, 0, 'f', 1));
 
-    // Cambio de color según la distancia de seguridad (25 cm)
     if (cm <= 25.0) {
-        m_distancia->setStyleSheet("QLabel { font-size: 24px; font-weight: bold; color: #e74c3c; }"); // Rojo (Frenado)
+        m_distancia->setStyleSheet("QLabel { font-size: 24px; font-weight: bold; color: #e74c3c; }");
     } else {
-        m_distancia->setStyleSheet("QLabel { font-size: 24px; font-weight: bold; color: #2ecc71; }"); // Verde (Seguro)
+        m_distancia->setStyleSheet("QLabel { font-size: 24px; font-weight: bold; color: #2ecc71; }");
     }
 
     m_serie->append(m_muestra, cm);
@@ -432,4 +594,86 @@ void MainWindow::agregarDistancia(double cm)
 void MainWindow::registrar(const QString &linea)
 {
     m_registro->appendPlainText(QDateTime::currentDateTime().toString("hh:mm:ss  ") + linea);
+}
+
+void MainWindow::guardarTemperatura(double celsius)
+{
+    const double c1 = qRound(celsius * 10) / 10.0;
+    QSqlQuery consulta;
+    consulta.prepare("INSERT INTO mediciones (fecha_hora, temperatura, fuente) "
+                     "VALUES (:fecha_hora, :temperatura, :fuente)");
+    consulta.bindValue(":fecha_hora", QDateTime::currentDateTime().toString(Qt::ISODate));
+    consulta.bindValue(":temperatura", c1);
+    consulta.bindValue(":fuente", QString::fromUtf8(FUENTE));
+
+    if (!consulta.exec()) {
+        registrar("INSERT falló: " + consulta.lastError().text());
+        return;
+    }
+
+    registrar(QString("Guardada %1 °C con id %2").arg(c1, 0, 'f', 1)
+                  .arg(consulta.lastInsertId().toString()));
+
+    cargarHistorial();
+}
+
+// ---------------------------------------------------------------- Paso 4: SELECT
+void MainWindow::cargarHistorial()
+{
+    if (!m_tabla || !m_total) return;
+
+    m_tabla->setEditTriggers(QAbstractItemView::NoEditTriggers);
+
+    QSqlQuery consulta("SELECT id, fecha_hora, temperatura, nota FROM mediciones "
+                       "ORDER BY id DESC");
+    if (!consulta.isActive()) {
+        registrar("SELECT falló: " + consulta.lastError().text());
+        return;
+    }
+
+    m_tabla->setRowCount(0);
+    while (consulta.next()) {
+        const int fila = m_tabla->rowCount();
+        m_tabla->insertRow(fila);
+        m_tabla->setItem(fila, 0, new QTableWidgetItem(consulta.value(0).toString()));
+        m_tabla->setItem(fila, 1, new QTableWidgetItem(consulta.value(1).toString()));
+        m_tabla->setItem(fila, 2, new QTableWidgetItem(
+                                      QString::number(consulta.value(2).toDouble(), 'f', 1)));
+        m_tabla->setItem(fila, 3, new QTableWidgetItem(consulta.value(3).toString()));
+    }
+    m_tabla->resizeColumnsToContents();
+
+    QSqlQuery total("SELECT COUNT(*) FROM mediciones");
+    if (total.next()) {
+        m_total->setText("Mediciones guardadas: " + total.value(0).toString());
+    }
+}
+
+// ---------------------------------------------------------------- Paso 5: UPDATE
+void MainWindow::guardarNota()
+{
+    if (!m_id || !m_nota) return;
+
+    const int idSeleccionado = m_id->value();
+
+    if (idSeleccionado == 0) {
+        registrar("Primero toca una fila");
+        return;
+    }
+
+    QSqlQuery consulta;
+    consulta.prepare("UPDATE mediciones SET nota = :nota WHERE id = :id");
+    consulta.bindValue(":nota", m_nota->text().trimmed());
+    consulta.bindValue(":id", idSeleccionado);
+
+    if (!consulta.exec()) {
+        registrar("UPDATE falló: " + consulta.lastError().text());
+        return;
+    }
+
+    const int afectadas = consulta.numRowsAffected();
+    registrar(QString("Filas cambiadas: %1 (id: %2)").arg(afectadas).arg(idSeleccionado));
+
+    m_nota->clear();
+    cargarHistorial();
 }

@@ -6,6 +6,8 @@
 #include <QTimer>
 #include <QJsonObject>
 #include <QStyle>
+#include <QTabWidget>
+#include <QTableWidget>
 
 class QLineEdit;
 class QSpinBox;
@@ -16,8 +18,8 @@ class QCheckBox;
 class QPlainTextEdit;
 class QLineSeries;
 class QValueAxis;
+class QVBoxLayout;
 
-// Una sola ventana: conexión, cruceta de movimiento, servo y gráfica de distancia.
 // La interfaz se arma en código (sin .ui) para que se adapte al tamaño del teléfono.
 class MainWindow : public QMainWindow
 {
@@ -51,6 +53,26 @@ private:
     void agregarDistancia(double cm);
     void registrar(const QString &linea);
 
+    // Almacenamiento e inserción de temperatura en SQLite
+    void guardarTemperatura(double celsius);
+
+    QTimer m_dhtAuto;                  // Timer para lectura automática cada 10 s
+    QCheckBox *m_chkDhtAuto = nullptr; // CheckBox "Guardar cada 10 s"
+
+    // Elementos de UI para consulta e historial
+    QTableWidget *m_tabla = nullptr;
+    QLabel *m_total = nullptr;
+
+    void cargarHistorial();
+
+    // Componentes para actualización de nota
+    QSpinBox *m_id = nullptr;
+    QLineEdit *m_nota = nullptr;
+
+    void guardarNota();
+
+    // --------------------------
+
     QWebSocket m_socket;
     QTimer m_latido;          // {"tipo":"latido"} cada 1 s (la ESP32 responde latido_ok)
     QTimer m_repetir;         // reenvía "mover" mientras se mantiene presionado un botón
@@ -75,6 +97,11 @@ private:
     QPlainTextEdit *m_registro = nullptr;
     QLineSeries *m_serie = nullptr;
     QValueAxis *m_ejeX = nullptr;
+
+    // Elementos de la pestaña Temperatura
+    QLabel *m_temperatura = nullptr;
+    QPushButton *m_botonLeerTemp = nullptr;
+    QVBoxLayout *m_capaTemp = nullptr;
 };
 
 #endif // MAINWINDOW_H

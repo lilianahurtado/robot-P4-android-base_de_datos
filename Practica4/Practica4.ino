@@ -2,6 +2,7 @@
 #include <WebSocketsServer.h>
 #include <ArduinoJson.h>
 #include <ESP32Servo.h>
+#include "DHT.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -30,7 +31,7 @@ WebSocketsServer webSocket = WebSocketsServer(81);
 #define PWM_RES  8
 
 uint8_t velAvanzar = 170;
-uint8_t velGiro    = 140;
+uint8_t velGiro    = 170;
 
 struct ComandoMover {
   char accion[16];
@@ -44,10 +45,15 @@ char accionActual[16] = "parar";
 // ---------------------------------------------------------------------------
 // 3) ASIGNACIÓN DE PINES Y VARIABLES DE CONTROL
 // ---------------------------------------------------------------------------
-const int PIN_SERVO  = 8;   
-const int TRIG_PIN   = 9;   
-const int ECHO_PIN   = 10;  
-const int BUZZER_PIN = 18;  
+const int PIN_SERVO    = 8;   
+const int TRIG_PIN     = 9;   
+const int ECHO_PIN     = 10;  
+const int BUZZER_PIN   = 18;  
+
+// Sensor de Temperatura DHT22
+#define DHTPIN 7              // Sensor DHT22 
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
 
 Servo servo;
 int anguloActual = 90;
@@ -57,10 +63,7 @@ const int pulsoMaximo = 2400;
 float distanciaActual = 100.0;
 unsigned long ultimoMuestreoUS = 0;
 
-// Distancia de seguridad para detener el avance y sonar la alarma
 const float DISTANCIA_SEGURIDAD_CM = 25.0; 
-
-// Control de la alarma sonora desde la UI de Qt
 bool alarmaHabilitada = true; 
 
 // ---------------------------------------------------------------------------
@@ -114,31 +117,22 @@ static inline void mover_derecha() {
 }
 
 // ---------------------------------------------------------------------------
-// MEDICIÓN ULTRASÓNICA CORREGIDA (Timeout ampliado a 25000 us)
+// MEDICIÓN ULTRASÓNICA RÁPIDA
 // ---------------------------------------------------------------------------
-float medirDistancia() {
-  float suma = 0;
-  int lecturasValidas = 0;
+float medirDistanciaRapida() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
 
-  for (int i = 0; i < 3; i++) {
-    digitalWrite(TRIG_PIN, LOW);
-    delayMicroseconds(2);
-    digitalWrite(TRIG_PIN, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(TRIG_PIN, LOW);
+  long duracion = pulseIn(ECHO_PIN, HIGH, 12000);
 
-    long duracion = pulseIn(ECHO_PIN, HIGH, 25000);
-    if (duracion > 0) {
-      suma += (duracion * 0.0343) / 2.0;
-      lecturasValidas++;
-    }
-    delayMicroseconds(500); // Pequeño intervalo entre pulsos para evitar ecos fantasma
+  if (duracion > 0) {
+    return (duracion * 0.0343) / 2.0;
   }
-
-  if (lecturasValidas == 0) return 400.0;
-  return suma / lecturasValidas;
+  return 400.0;
 }
-
 
 // ---------------------------------------------------------------------------
 // TAREA FREERTOS DE MOVIMIENTO
@@ -151,7 +145,6 @@ void tareaEjecutarMovimiento(void *pvParameters) {
       strncpy(accionActual, cmd.accion, sizeof(accionActual) - 1);
 
       if (strcmp(cmd.accion, "avanzar") == 0) {
-        // Confirmar que la lectura sea realmente menor a 25 cm y no un pico falso
         if (distanciaActual > 0.0 && distanciaActual <= DISTANCIA_SEGURIDAD_CM) {
           motores_parar_total();
           strcpy(accionActual, "parar");
@@ -222,7 +215,6 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         servo.write(anguloActual);
       }
       else if (strcmp(tipo, "leer_distancia") == 0) {
-        distanciaActual = medirDistancia();
         JsonDocument docDist;
         docDist["tipo"] = "distancia_lectura";
         docDist["d"] = round(distanciaActual * 10.0) / 10.0;
@@ -235,9 +227,9 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         int ang = doc["angulo"] | 90;
         anguloActual = constrain(ang, 0, 180);
         servo.write(anguloActual);
-        
-        vTaskDelay(pdMS_TO_TICKS(150));
-        distanciaActual = medirDistancia();
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+        distanciaActual = medirDistanciaRapida();
 
         JsonDocument docScan;
         docScan["tipo"] = "scan";
@@ -248,11 +240,27 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         serializeJson(docScan, res);
         webSocket.sendTXT(num, res);
       }
-      //Recibir activación/desactivación del Buzzer desde Qt
+      else if (strcmp(tipo, "leer_dht") == 0) {
+        float temp = dht.readTemperature();
+        JsonDocument docDht;
+        docDht["tipo"] = "dht_lectura";
+        
+        if (isnan(temp)) {
+          docDht["dht_ok"] = false;
+          docDht["temperatura"] = nullptr;
+        } else {
+          docDht["dht_ok"] = true;
+          docDht["temperatura"] = round(temp * 10.0) / 10.0;
+        }
+        
+        String res;
+        serializeJson(docDht, res);
+        webSocket.sendTXT(num, res);
+      }
       else if (strcmp(tipo, "alarma") == 0) {
         alarmaHabilitada = doc["estado"] | true;
         if (!alarmaHabilitada) {
-          digitalWrite(BUZZER_PIN, LOW); // Apaga de inmediato si se desactiva
+          digitalWrite(BUZZER_PIN, LOW);
         }
       }
       else if (strcmp(tipo, "latido") == 0) {
@@ -280,6 +288,9 @@ void setup() {
   
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
+
+  // Inicialización del sensor DHT22
+  dht.begin();
 
   ESP32PWM::allocateTimer(0);
   servo.setPeriodHertz(50);
@@ -311,20 +322,16 @@ void loop() {
 
   unsigned long ahora = millis();
 
-  // Muestreo del sensor ultrasónico (Cada 30 ms)
-  if (ahora - ultimoMuestreoUS >= 30) {
+  if (ahora - ultimoMuestreoUS >= 60) {
     ultimoMuestreoUS = ahora;
-    distanciaActual = medirDistancia();
+    distanciaActual = medirDistanciaRapida();
 
-    // Bloqueo inmediato de motores si intenta avanzar hacia un obstáculo a <= 25 cm
     if (strcmp(accionActual, "avanzar") == 0 && distanciaActual <= DISTANCIA_SEGURIDAD_CM) {
       motores_parar_total();
       strcpy(accionActual, "parar");
     }
   }
 
-  // El buzzer solo suena continuo si se detecta obstáculo a <= 25 cm
-  // alarma está habilitada desde la UI de Qt.
   if (alarmaHabilitada && distanciaActual <= DISTANCIA_SEGURIDAD_CM) {
     digitalWrite(BUZZER_PIN, HIGH);
   } else {
