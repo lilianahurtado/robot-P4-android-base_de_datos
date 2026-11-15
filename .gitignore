@@ -1,0 +1,5 @@
+build-*
+*.pro.user
+*.apk
+*.aab
+.qmake.stash
