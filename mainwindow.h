@@ -20,6 +20,7 @@ class QLineSeries;
 class QValueAxis;
 class QVBoxLayout;
 
+
 // La interfaz se arma en código (sin .ui) para que se adapte al tamaño del teléfono.
 class MainWindow : public QMainWindow
 {
@@ -43,8 +44,12 @@ private slots:
     void alPresionarMedir();
     void alPresionarBarrido();
     void siguientePasoBarrido();
+    void eliminarRango();
 
 private:
+    QSpinBox *m_idInicio = nullptr;
+    QSpinBox *m_idFin = nullptr;
+
     void construirInterfaz();
     QPushButton *botonMovimiento(QStyle::StandardPixmap icono, const QString &accion);
     void aplicarEstilosUI();
@@ -53,25 +58,26 @@ private:
     void agregarDistancia(double cm);
     void registrar(const QString &linea);
 
-    // Almacenamiento e inserción de temperatura en SQLite
+    //Almacenamiento e inserción de temperatura en SQLite
     void guardarTemperatura(double celsius);
 
-    QTimer m_dhtAuto;                  // Timer para lectura automática cada 10 s
+    QTimer m_dhtAuto;                 // Timer para lectura automática cada 10 s
     QCheckBox *m_chkDhtAuto = nullptr; // CheckBox "Guardar cada 10 s"
 
-    // Elementos de UI para consulta e historial
+    //Elementos de UI para consulta e historial
     QTableWidget *m_tabla = nullptr;
     QLabel *m_total = nullptr;
 
     void cargarHistorial();
 
-    // Componentes para actualización de nota
+    //Componentes para actualización de nota
     QSpinBox *m_id = nullptr;
     QLineEdit *m_nota = nullptr;
 
     void guardarNota();
 
-    // --------------------------
+    //matriz
+    QCheckBox *m_chkMatriz = nullptr;
 
     QWebSocket m_socket;
     QTimer m_latido;          // {"tipo":"latido"} cada 1 s (la ESP32 responde latido_ok)
@@ -101,7 +107,8 @@ private:
     // Elementos de la pestaña Temperatura
     QLabel *m_temperatura = nullptr;
     QPushButton *m_botonLeerTemp = nullptr;
-    QVBoxLayout *m_capaTemp = nullptr;
+    QVBoxLayout *m_capaTemp = nullptr; // Declaración de m_capaTemp
+
 };
 
 #endif // MAINWINDOW_H

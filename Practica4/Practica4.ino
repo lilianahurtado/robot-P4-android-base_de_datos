@@ -2,6 +2,7 @@
 #include <WebSocketsServer.h>
 #include <ArduinoJson.h>
 #include <ESP32Servo.h>
+#include <Adafruit_NeoPixel.h>
 #include "DHT.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -49,11 +50,15 @@ const int PIN_SERVO    = 8;
 const int TRIG_PIN     = 9;   
 const int ECHO_PIN     = 10;  
 const int BUZZER_PIN   = 18;  
+const int NEOPIXEL_PIN = 4;    // Matriz WS2812B 
+#define NUM_LEDS 64
 
 // Sensor de Temperatura DHT22
 #define DHTPIN 7              // Sensor DHT22 
 #define DHTTYPE DHT22
 DHT dht(DHTPIN, DHTTYPE);
+
+Adafruit_NeoPixel matriz(NUM_LEDS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
 Servo servo;
 int anguloActual = 90;
@@ -62,9 +67,171 @@ const int pulsoMaximo = 2400;
 
 float distanciaActual = 100.0;
 unsigned long ultimoMuestreoUS = 0;
+unsigned long ultimoAnimacionNeo = 0;
+uint8_t pasoAnimacion = 0;
+
+enum ModoMatriz { MODO_NORMAL, MODO_RADAR, MODO_AGUJA };
+ModoMatriz modoMatrizActual = MODO_NORMAL;
+unsigned long tiempoFinModoEspecial = 0;
 
 const float DISTANCIA_SEGURIDAD_CM = 25.0; 
 bool alarmaHabilitada = true; 
+bool matrizHabilitada = true;  // Control de la casilla "Matriz" en la app Qt
+
+// ---------------------------------------------------------------------------
+// MAPAS DE BIT 8x8 EN PROGMEM
+// ---------------------------------------------------------------------------
+const uint8_t PROGMEM flechaAbajo_1[8] = {
+  B00000000, B00011000, B00111100, B01111110, B00011000, B00011000, B00011000, B00000000
+};
+const uint8_t PROGMEM flechaAbajo_2[8] = {
+  B00011000, B00111100, B01111110, B00011000, B00011000, B00011000, B00000000, B00000000
+};
+
+const uint8_t PROGMEM flechaArriba_1[8] = {
+  B00000000, B00011000, B00011000, B00011000, B01111110, B00111100, B00011000, B00000000
+};
+const uint8_t PROGMEM flechaArriba_2[8] = {
+  B00000000, B00000000, B00011000, B00011000, B00011000, B01111110, B00111100, B00011000
+};
+
+const uint8_t PROGMEM flechaDerecha[8] = {
+  B00001000, B00011000, B00111000, B01111111, B01111111, B00111000, B00011000, B00001000
+};
+
+const uint8_t PROGMEM flechaIzquierda[8] = {
+  B00010000, B00011000, B00011100, B11111110, B11111110, B00011100, B00011000, B00010000
+};
+
+const uint8_t PROGMEM puntoCentral[8] = {
+  B00000000, B00000000, B00000000, B00011000, B00011000, B00000000, B00000000, B00000000
+};
+
+const uint8_t PROGMEM ecualizador_1[8] = {
+  B00000000, B00000000, B01000010, B01000010, B01011010, B01011010, B01111110, B01111110
+};
+const uint8_t PROGMEM ecualizador_2[8] = {
+  B01000010, B01011010, B01011010, B01111110, B01111110, B01011010, B01000010, B00000000
+};
+
+const uint8_t PROGMEM agujaIzquierda[8] = {
+  B10000000, B01000000, B00100000, B00010000, B00001000, B00000100, B00000010, B00000001
+};
+const uint8_t PROGMEM agujaCentro[8] = {
+  B00011000, B00011000, B00011000, B00011000, B00011000, B00011000, B00011000, B00011000
+};
+const uint8_t PROGMEM agujaDerecha[8] = {
+  B00000001, B00000010, B00000100, B00001000, B00010000, B00100000, B01000000, B10000000
+};
+
+// ---------------------------------------------------------------------------
+// FUNCIONES DE MATRIZ NEOPIXEL 
+// ---------------------------------------------------------------------------
+void renderizarIcono(const uint8_t icono[8], uint32_t color) {
+  matriz.clear();
+  for (int y = 0; y < 8; y++) {
+    uint8_t fila = pgm_read_byte(&(icono[y]));
+    for (int x = 0; x < 8; x++) {
+      if (fila & (1 << (7 - x))) {
+        int nuevoX = y;
+        int nuevoY = 7 - x;
+        int index = nuevoY * 8 + nuevoX;
+        matriz.setPixelColor(index, color);
+      }
+    }
+  }
+  matriz.show();
+}
+
+void renderizarRadar(int angulo) {
+  matriz.clear();
+  int columnaOriginal = map(constrain(angulo, 0, 180), 0, 180, 0, 7);
+  uint32_t verdeRadar = matriz.Color(0, 255, 50);
+
+  for (int y = 0; y < 8; y++) {
+    int nuevoX = y;
+    int nuevoY = 7 - columnaOriginal;
+    int index = nuevoY * 8 + nuevoX;
+    matriz.setPixelColor(index, verdeRadar);
+  }
+  matriz.show();
+}
+
+void renderizarAgujaServo(int angulo) {
+  uint32_t cCyan = matriz.Color(0, 200, 255);
+  if (angulo < 60) {
+    renderizarIcono(agujaIzquierda, cCyan);
+  } else if (angulo > 120) {
+    renderizarIcono(agujaDerecha, cCyan);
+  } else {
+    renderizarIcono(agujaCentro, cCyan);
+  }
+}
+
+void actualizarMatrizNeoPixel() {
+  // Si la matriz está desactivada desde la app Qt, apagar LEDs y no renderizar nada
+  if (!matrizHabilitada) {
+    matriz.clear();
+    matriz.show();
+    return;
+  }
+
+  // Modo Patrulla/Policía en caso de frenado por obstáculo
+  if (distanciaActual <= DISTANCIA_SEGURIDAD_CM) {
+    if (pasoAnimacion == 0) {
+      matriz.fill(matriz.Color(255, 0, 0), 0, NUM_LEDS);
+    } else {
+      matriz.fill(matriz.Color(0, 0, 255), 0, NUM_LEDS);
+    }
+    matriz.show();
+    return;
+  }
+
+  // Animación de ecualizador si suena la alarma sonora
+  if (alarmaHabilitada && digitalRead(BUZZER_PIN) == HIGH) {
+    uint32_t cAmarillo = matriz.Color(255, 200, 0);
+    if (pasoAnimacion == 0) renderizarIcono(ecualizador_1, cAmarillo);
+    else renderizarIcono(ecualizador_2, cAmarillo);
+    return;
+  }
+
+  if (modoMatrizActual != MODO_NORMAL && millis() > tiempoFinModoEspecial) {
+    modoMatrizActual = MODO_NORMAL;
+  }
+
+  if (modoMatrizActual == MODO_RADAR) {
+    renderizarRadar(anguloActual);
+    return;
+  }
+  if (modoMatrizActual == MODO_AGUJA) {
+    renderizarAgujaServo(anguloActual);
+    return;
+  }
+
+  uint32_t verde = matriz.Color(0, 255, 0);
+  uint32_t ambar = matriz.Color(255, 180, 0);
+  uint32_t azul  = matriz.Color(0, 100, 255);
+
+  if (strcmp(accionActual, "avanzar") == 0) {
+    if (pasoAnimacion == 0) renderizarIcono(flechaArriba_1, verde);
+    else renderizarIcono(flechaArriba_2, verde);
+  } 
+  else if (strcmp(accionActual, "retroceder") == 0) {
+    if (pasoAnimacion == 0) renderizarIcono(flechaAbajo_1, verde);
+    else renderizarIcono(flechaAbajo_2, verde);
+  } 
+  else if (strcmp(accionActual, "izquierda") == 0) {
+    if (pasoAnimacion == 0) renderizarIcono(flechaIzquierda, ambar);
+    else matriz.clear(), matriz.show();
+  } 
+  else if (strcmp(accionActual, "derecha") == 0) {
+    if (pasoAnimacion == 0) renderizarIcono(flechaDerecha, ambar);
+    else matriz.clear(), matriz.show();
+  } 
+  else {
+    renderizarIcono(puntoCentral, azul);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // FUNCIONES DE CONTROL DE MOTORES
@@ -213,6 +380,9 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         int ang = doc["angulo"] | 90;
         anguloActual = constrain(ang, 0, 180);
         servo.write(anguloActual);
+
+        modoMatrizActual = MODO_AGUJA;
+        tiempoFinModoEspecial = millis() + 800;
       }
       else if (strcmp(tipo, "leer_distancia") == 0) {
         JsonDocument docDist;
@@ -227,6 +397,9 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         int ang = doc["angulo"] | 90;
         anguloActual = constrain(ang, 0, 180);
         servo.write(anguloActual);
+
+        modoMatrizActual = MODO_RADAR;
+        tiempoFinModoEspecial = millis() + 1000;
 
         vTaskDelay(pdMS_TO_TICKS(100));
         distanciaActual = medirDistanciaRapida();
@@ -263,6 +436,13 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
           digitalWrite(BUZZER_PIN, LOW);
         }
       }
+      else if (strcmp(tipo, "matriz") == 0) {
+        matrizHabilitada = doc["estado"] | true;
+        if (!matrizHabilitada) {
+          matriz.clear();
+          matriz.show();
+        }
+      }
       else if (strcmp(tipo, "latido") == 0) {
         JsonDocument docLatido;
         docLatido["tipo"] = "latido_ok";
@@ -291,6 +471,11 @@ void setup() {
 
   // Inicialización del sensor DHT22
   dht.begin();
+
+  matriz.begin();
+  matriz.setBrightness(30);
+  matriz.clear();
+  matriz.show();
 
   ESP32PWM::allocateTimer(0);
   servo.setPeriodHertz(50);
@@ -330,6 +515,12 @@ void loop() {
       motores_parar_total();
       strcpy(accionActual, "parar");
     }
+  }
+
+  if (ahora - ultimoAnimacionNeo >= 120) {
+    ultimoAnimacionNeo = ahora;
+    pasoAnimacion = !pasoAnimacion;
+    actualizarMatrizNeoPixel();
   }
 
   if (alarmaHabilitada && distanciaActual <= DISTANCIA_SEGURIDAD_CM) {

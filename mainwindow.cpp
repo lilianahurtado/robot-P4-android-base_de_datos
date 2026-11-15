@@ -34,7 +34,7 @@
 static const int MS_MOVIMIENTO = 400;
 static const int MS_REPETIR = 200;
 static const int VENTANA_MUESTRAS = 40;
-static const char *ALUMNO = "ALUMNO · CODIGO · temperatura_XXXX.db";
+static const char *ALUMNO = "NOMBRE · CODIGO · temperatura_XXXX.db";
 static const char *FUENTE = "dht22";
 
 MainWindow::MainWindow(QWidget *parent)
@@ -138,7 +138,9 @@ void MainWindow::construirInterfaz()
     raiz->addWidget(cajaConexion);
     raiz->addWidget(m_estado);
 
+    //empieza aqui
     // 2) Cruceta de movimiento
+
     auto *cajaMover = new QGroupBox(tr("Movimiento"));
     auto *cruceta = new QGridLayout(cajaMover);
     cruceta->addWidget(botonMovimiento(QStyle::SP_ArrowUp, "avanzar"), 0, 1);
@@ -146,7 +148,21 @@ void MainWindow::construirInterfaz()
     cruceta->addWidget(botonMovimiento(QStyle::SP_MediaStop, "parar"), 1, 1);
     cruceta->addWidget(botonMovimiento(QStyle::SP_ArrowRight, "derecha"), 1, 2);
     cruceta->addWidget(botonMovimiento(QStyle::SP_ArrowDown, "retroceder"), 2, 1);
+
+
+
+    // Casilla "Matriz" en la esquina inferior izquierda (Fila 2, Columna 0)
+    m_chkMatriz = new QCheckBox(tr("Matriz"));
+    m_chkMatriz->setChecked(true);
+    cruceta->addWidget(m_chkMatriz, 2, 0, Qt::AlignLeft | Qt::AlignVCenter);
+
+    connect(m_chkMatriz, &QCheckBox::toggled, this, [this](bool activo) {
+        enviar({{"tipo", "matriz"}, {"estado", activo}});
+    });
+
     raiz->addWidget(cajaMover);
+
+    //desde aqui
 
     // 3) Servo
     auto *cajaServo = new QGroupBox(tr("Servo del sensor"));
@@ -278,10 +294,11 @@ void MainWindow::construirInterfaz()
     colTemp->addWidget(m_tabla, 1);
     colTemp->addWidget(m_total);
 
-    // --- PASO 5: Editar Nota (UPDATE) ---
-    auto *cajaNota = new QGroupBox(tr("Editar nota de medición"));
+    // --- PASO 5: Editar Nota (UPDATE) y Eliminar Rango (DELETE) ---
+    auto *cajaNota = new QGroupBox(tr("Gestión de registros"));
     auto *colNota = new QVBoxLayout(cajaNota);
 
+    // Fila 1: Editar nota
     auto *filaCamposNota = new QHBoxLayout;
     m_id = new QSpinBox;
     m_id->setRange(0, 99999);
@@ -301,7 +318,30 @@ void MainWindow::construirInterfaz()
     filaCamposNota->addWidget(m_nota, 3);
     filaCamposNota->addWidget(botonGuardarNota, 2);
 
+    // Fila 2: Eliminar por rango de IDs
+    auto *filaEliminarRango = new QHBoxLayout;
+    m_idInicio = new QSpinBox;
+    m_idInicio->setRange(0, 99999);
+    m_idInicio->setSpecialValueText("-");
+
+    m_idFin = new QSpinBox;
+    m_idFin->setRange(0, 99999);
+    m_idFin->setSpecialValueText("-");
+
+    auto *botonEliminarRango = new QPushButton(tr("Eliminar rango"));
+    botonEliminarRango->setStyleSheet(
+        "QPushButton { background-color: #ff5555; color: white; font-weight: bold; border-radius: 6px; padding: 6px; }"
+        "QPushButton:hover { background-color: #ff6e6e; }"
+        );
+
+    filaEliminarRango->addWidget(new QLabel(tr("Desde:")));
+    filaEliminarRango->addWidget(m_idInicio, 1);
+    filaEliminarRango->addWidget(new QLabel(tr("Hasta:")));
+    filaEliminarRango->addWidget(m_idFin, 1);
+    filaEliminarRango->addWidget(botonEliminarRango, 2);
+
     colNota->addLayout(filaCamposNota);
+    colNota->addLayout(filaEliminarRango);
     colTemp->addWidget(cajaNota);
 
     m_capaTemp->addWidget(cajaTemp, 1);
@@ -325,10 +365,13 @@ void MainWindow::construirInterfaz()
         if (m_tabla->item(fila, 0)) {
             int idTocada = m_tabla->item(fila, 0)->text().toInt();
             m_id->setValue(idTocada);
+            m_idInicio->setValue(idTocada);
+            m_idFin->setValue(idTocada);
         }
     });
 
     connect(botonGuardarNota, &QPushButton::clicked, this, &MainWindow::guardarNota);
+    connect(botonEliminarRango, &QPushButton::clicked, this, &MainWindow::eliminarRango);
 
     pestanas->addTab(pagTemp, "Temperatura");
     setCentralWidget(pestanas);
@@ -466,6 +509,9 @@ void MainWindow::alDesconectar()
     }
     if (m_auto) {
         m_auto->setChecked(false);
+    }
+    if (m_chkMatriz) {
+        m_chkMatriz->setChecked(false);
     }
 
     m_estado->setText(tr("Estado: Desconectado"));
@@ -677,3 +723,56 @@ void MainWindow::guardarNota()
     m_nota->clear();
     cargarHistorial();
 }
+
+// ---------------------------------------------------------------- Eliminar Rango y Reiniciar Secuencia
+void MainWindow::eliminarRango()
+{
+    if (!m_idInicio || !m_idFin) return;
+
+    int inicio = m_idInicio->value();
+    int fin = m_idFin->value();
+
+    if (inicio == 0 || fin == 0) {
+        registrar("Selecciona un ID inicial y final válidos");
+        return;
+    }
+
+    // Si se ingresan invertidos, se ordenan automáticamente
+    if (inicio > fin) {
+        qSwap(inicio, fin);
+    }
+
+    QSqlQuery consulta;
+    consulta.prepare("DELETE FROM mediciones WHERE id BETWEEN :inicio AND :fin");
+    consulta.bindValue(":inicio", inicio);
+    consulta.bindValue(":fin", fin);
+
+    if (!consulta.exec()) {
+        registrar("DELETE falló: " + consulta.lastError().text());
+        return;
+    }
+
+    const int eliminadas = consulta.numRowsAffected();
+
+    // --- REINICIAR CONTADOR DE AUTOINCREMENTO (sqlite_sequence) ---
+    QSqlQuery maxQuery("SELECT COALESCE(MAX(id), 0) FROM mediciones");
+    if (maxQuery.next()) {
+        const int maxIdActual = maxQuery.value(0).toInt();
+
+        QSqlQuery resetSeq;
+        resetSeq.prepare("UPDATE sqlite_sequence SET seq = :maxId WHERE name = 'mediciones'");
+        resetSeq.bindValue(":maxId", maxIdActual);
+        resetSeq.exec();
+    }
+
+    registrar(QString("Filas eliminadas: %1 (rango %2 - %3). Contador ajustado.")
+                  .arg(eliminadas)
+                  .arg(inicio)
+                  .arg(fin));
+
+    m_idInicio->setValue(0);
+    m_idFin->setValue(0);
+    m_id->setValue(0);
+    cargarHistorial();
+}
+
